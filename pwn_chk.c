@@ -17,17 +17,8 @@
 #include <ctype.h>
 
 /*
- * This callback-function is invoked when fresh data has been downloaded
- * via libcurl.
- */
-size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream)
-{
-    size_t written = fwrite(ptr, size, nmemb, stream);
-    return written;
-}
-
-/*
  * Test to see if the given SHA1-hash is known to the HaveIBeenPwnd site.
+ * Expects uppercase hash.
  *
  * Return value:
  *
@@ -39,158 +30,43 @@ size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream)
 int was_leaked(char *hash)
 {
 
-    /*
-     * Sanity-check that our input is valid.
-     */
-    if (hash == NULL  || strlen(hash) != 40)
-    {
-        openlog("pam_pwnd", 0, 0);
-        syslog(LOG_ERR, "pam_pwnd: Invalid input for was_leaked(%s).", hash);
-        closelog();
-        return -1;
-    }
+	/*
+	 * Sanity-check that our input is valid.
+	 */
+	if (hash == NULL  || strlen(hash) != 40)
+	{
+		openlog("pam_pwnd", 0, 0);
+		syslog(LOG_ERR, "pam_pwnd: Invalid input for was_leaked(%s).", hash);
+		closelog();
+		return -1;
+	}
 
-    /*
-     * We're going to make a request via Curl, so we need a curl
-     * object/structure for interfacing with that library.
-     */
-    CURL *curl;
-    CURLcode res;
+	FILE* file_descriptor = fopen("/etc/pwned-passwords.txt", "r");
+	if (file_descriptor == NULL) {
+		return -1;
+	}
 
-    /*
-     * For the HaveIBeenPwnd API we need to make a request with the
-     * first five characters of the SHA1-hash, and then look for the
-     * rest of the hash in the response.
-     *
-     * Extract the first five characters into one buffer, and the rest
-     * into another.
-     */
-    char start[6] = {'\0'};
-    strncpy(start, hash, 5);
-    char rest[40] = {'\0'};
-    strncpy(rest,  hash + 5, sizeof(rest) - 1);
+	size_t line_size = 41;
+	char* line = malloc(line_size*sizeof(char)); // it will get realloced longer
+	char pwned_hash[41] = {'\0'};
 
-    /*
-     * Our hash-prefix should be upper-cased.
-     */
-    for (unsigned int i = 0; i < strlen(start); i++)
-    {
-        start[i] = toupper(start[i]);
-    }
+	int return_val = 0;
 
-    /*
-     * As should our suffix.
-     */
-    for (unsigned int i = 0; i < strlen(rest); i++)
-    {
-        rest[i] = toupper(rest[i]);
-    }
+	while (1) {
+		if (getline(&line, &line_size, file_descriptor) == -1) {
+			// check errno and maybe return -1?
+			break; // fail open, but also if we reach the end of the file
+		}
 
-    /*
-     * The URL we're fetching.
-     */
-    char url[100] = {'\0'};
-    snprintf(url, sizeof(url) - 1,
-             "https://api.pwnedpasswords.com/range/%s", start);
+		strncpy(pwned_hash, line, 40);
+		if (strcmp(pwned_hash, hash) == 0) {
+			return_val = 1;
+			break;
+		}
+	}
 
-    /*
-     * Create a temporary file to hold the response - note that we
-     * setup our umask first such that the file will be readable
-     * only by the owner.
-     */
-    umask(077);
-    FILE * fd = tmpfile();
+	fclose(file_descriptor);
+	free(line);
 
-    /*
-     * Initialize curl.
-     */
-    curl = curl_easy_init();
-
-    if (!curl)
-    {
-        openlog("pam_pwnd", 0, 0);
-        syslog(LOG_ERR, "pam_pwnd: Failed to setup curl.");
-        closelog();
-        fclose(fd);
-        return -1;
-    }
-
-    /*
-     * Setup the request.
-     */
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fd);
-
-    /*
-     * Perform the request - this is blocking.
-     */
-    long res_code = 0;
-    res = curl_easy_perform(curl);
-
-    /*
-     * Did we receive an error from the remote call?
-     */
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &res_code);
-
-    if (!(res_code == 200) && res != CURLE_ABORTED_BY_CALLBACK)
-    {
-
-        /*
-         * Log the return-code.
-         */
-        openlog("pam_pwnd", 0, 0);
-        syslog(LOG_ERR, "pam_pwnd: HTTP Response code was not 200: %ld", res_code);
-        closelog();
-
-        curl_easy_cleanup(curl);
-        fclose(fd);
-        return -1;
-    }
-
-    /*
-     * Cleanup the curl request.
-     */
-    curl_easy_cleanup(curl);
-
-    /*
-     * At this point we should have a temporary-file containing the result
-     * of the request which will be a series of lines of the form:
-     *
-     *  HASH:COUNT
-     *
-     * "HASH" is the SHA1-hash (minus the first five characters).
-     *
-     * "COUNT" is the number of times the hash was leaked (we're going to
-     * ignore that, we just care if the password-hash is present at all).
-     *
-     */
-
-    /*
-     * Rewind the file-handle and scan the contents, line-by-line.
-     */
-    rewind(fd);
-    char * line = NULL;
-    size_t len = 0;
-    ssize_t read;
-    int found = 0;
-
-    while ((read = getline(&line, &len, fd)) != -1)
-    {
-        if (strncmp(rest, line, strlen(rest)) == 0)
-        {
-            openlog("pam_pwnd", 0, 0);
-            syslog(LOG_ERR, "pam_pwnd: Password hash is known-leaked: %s", hash);
-            closelog();
-
-            found = 1;
-        }
-    }
-
-    /*
-     * Close the file-handle, which should trigger an unlink too.
-     */
-    fclose(fd);
-    return found;
-
+	return return_val;
 }
